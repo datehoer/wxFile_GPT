@@ -8,7 +8,7 @@ import hashlib
 import requests
 from requests.exceptions import Timeout
 from requests_toolbelt import MultipartEncoder
-
+from config import KEY, URL_HOST
 from retry.api import retry_call
 
 import time
@@ -25,6 +25,43 @@ requests.packages.urllib3.disable_warnings()
 WX_LOGIN_HOST = "https://login.wx.qq.com"
 WX_FILEHELPER_HOST = "https://szfilehelper.weixin.qq.com"
 WX_FILEUPLOAD_HOST = "https://file.wx2.qq.com"
+MAX_TEXT_LENGTH = 2000
+
+
+def generate_message_id():
+    """生成消息 id"""
+    return str(time.time()).replace('.', '')+str(random.randint(0, 9))
+
+
+def chat_with_gpt(prompt):
+    err = 3
+    while err > 0:
+        url = "https://{}/v1/chat/completions".format(URL_HOST)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + KEY,
+        }
+        data = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "system", "content": "你是一个聊天机器人，帮助回答一些问题."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": MAX_TEXT_LENGTH,
+            "temperature": 0.7
+        }
+        try:
+            response = requests.post(url, headers=headers, json=data)
+            response_json = response.json()
+            print("chatgpt response -->" + str(response_json))
+            if "choices" in response_json:
+                choices = response_json["choices"]
+                if len(choices) > 0 and "message" in choices[0] and "content" in choices[0]["message"]:
+                    return choices[0]["message"]["content"]
+        except Exception as e:
+            print(e)
+            err -= 1
+    return "出现错误"
 
 
 class Message:
@@ -57,10 +94,6 @@ class Message:
 
         self.wx_req = WXRequest()
 
-    def generate_message_id(self):
-        """生成消息 id"""
-        return str(time.time()).replace('.', '')+str(random.randint(0, 9))
-
     def generate_base_request(self):
         """生成 BaseRequest"""
         return {
@@ -75,7 +108,7 @@ class Message:
         return {
             "UploadType": 2,
             "BaseRequest": self.generate_base_request(),
-            "ClientMediaId": self.generate_message_id(),
+            "ClientMediaId": generate_message_id(),
             "TotalLen": file_size,
             "StartPos": 0,
             "DataLen": file_size,
@@ -131,7 +164,7 @@ class Message:
         :param media_id: 媒体消息
         """
 
-        msg_id = self.generate_message_id()
+        msg_id = generate_message_id()
         # 解决中文乱码问题
         msg_data = json.dumps({
             "BaseRequest": self.generate_base_request(),
@@ -150,7 +183,9 @@ class Message:
 
     def send_msg(self, content=None, file_path=None):
         """发送消息"""
-
+        url = ''
+        params = {}
+        data = {}
         if content:
             url = f"{WX_FILEHELPER_HOST}/cgi-bin/mmwebwx-bin/webwxsendmsg"
 
@@ -172,8 +207,7 @@ class Message:
             data = self.bind_msg_data(type_=3, media_id=media_id)
 
         self.wx_req.update_headers({"Content-Type": "application/json"})
-        resp = self.wx_req.fetch(
-            url, method="post", params=params, data=data)
+        resp = self.wx_req.fetch(url, method="post", params=params, data=data)
         if resp:
             data = resp.json()
             if data['BaseResponse']['Ret'] == 0:
@@ -229,6 +263,11 @@ class Message:
                         if msg['MsgType'] == 1:
                             # 文本消息
                             print(msg['Content'])
+                            if "@help" in msg['Content']:
+                                content = msg['Content'].split("@help")[-1].strip()
+                                if content:
+                                    content = chat_with_gpt(content)
+                                    self.send_msg(content)
                     self.sync_key = data['SyncKey']
             else:
                 raise ValueError("Webwxsync failed")
@@ -354,6 +393,11 @@ class WXRequest:
         self.headers.update(headers)
 
 
+def check_init_exist():
+    """检测初始化文件是否存在"""
+    return os.path.exists('init.json')
+
+
 class WXFilehelper:
     def __init__(self):
         self.wx_req = WXRequest()
@@ -361,26 +405,15 @@ class WXFilehelper:
 
         if self.wait_login():
             self.message.wait_msg()
-
         # self.message.send_msg("你好")
         # self.message.send_msg(file_path="/Users/zzzzls/Desktop/desk.png")
 
-    def check_init_exist(self):
-        """检测初始化文件是否存在"""
-        return os.path.exists('init.json')
-
     def wait_login(self):
-        if self.check_init_exist():
-            with open("init.json", 'r') as f:
-                config = json.load(f)
-        else:
-            uuid = self.__generate_QRLogin_uuid()
-            self.__generate_QR_code(uuid)
-            print("\rScan Code, pls ...", end='')
-            config = retry_call(self.__check_login_status, fkwargs={
-                "uuid": uuid}, exceptions=(ValueError, Timeout), tries=50, delay=0.5)
-            with open('init.json', 'w') as f:
-                json.dump(config, f)
+        uuid = self.__generate_QRLogin_uuid()
+        self.__generate_QR_code(uuid)
+        print("\rScan Code, pls ...", end='')
+        config = retry_call(self.__check_login_status, fkwargs={
+            "uuid": uuid}, exceptions=(ValueError, Timeout), tries=50, delay=0.5)
         self.message.uin = config['uin']
         self.message.sid = config['sid']
         self.message.skey = config['skey']
@@ -443,7 +476,7 @@ class WXFilehelper:
             print("\rPress OK, pls ...", end='')
             raise ValueError("Press OK")
         elif wcode == '200':
-            print("\rLogin success, Welcome~", end='')
+            print("\rLogin success, Welcome", end='')
 
             redirect_url = Utils.match(
                 r'window.redirect_uri="(.*?)"', resp.text)
@@ -478,7 +511,6 @@ class WXFilehelper:
             "pass_ticket": self.message.pass_ticket
         }
         data = {"BaseRequest": self.message.generate_base_request()}
-
         self.wx_req.update_headers({"mmweb_appid": "wx_webfilehelper"})
 
         resp = self.wx_req.fetch(f'{WX_FILEHELPER_HOST}/cgi-bin/mmwebwx-bin/webwxinit',
